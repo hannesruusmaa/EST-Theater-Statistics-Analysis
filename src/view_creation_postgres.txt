@@ -1,0 +1,422 @@
+-- lisatud max_etenduseaasta
+
+-- Run this entire file as a SQL script in DBeaver.
+-- The existing source tables and their column names must match the CSV headers.
+-- Creates exactly six views in teatriliit. Source tables are not changed.
+-- Dates may be imported as DD.MM.YYYY text or as PostgreSQL dates.
+-- Numeric columns may be imported as numbers or text; empty values remain NULL.
+-- Production identity is the trimmed title plus premiere date, without theater.
+-- Numbering is deterministic for the current data, but new titles can shift IDs.
+-- Refresh all six views together in Power BI after changing the source data.
+-- IDs have at least three digits: P001 ... P999, P1000, etc.
+--rollback;
+BEGIN;
+
+-----parandab repertuaari tabelis lavastuse nimed vastavalt korrektsiooni tabelile ----------------
+update teatriliit.repertuaar_kokku rk
+	set lavastuse_pealkiri = temp.lavastuse_pealkiri_parandatud
+	,esietendus = temp.esietendus_parandatud
+from (select lavastuse_pealkiri_algne, 
+	esietendus, 
+	autor_dramatiseerija, 
+	lavastuse_pealkiri_parandatud, esietendus_parandatud, id from teatriliit.lavastuse_nimekorrektsioon) temp
+	where coalesce(rk.lavastuse_pealkiri::text, '') = coalesce(temp.lavastuse_pealkiri_algne::text, '')
+		and coalesce(rk.esietendus::text, '') = coalesce(temp.esietendus::text, '')
+		and coalesce(rk.autor::text, '') = coalesce(temp.autor_dramatiseerija::text, '');
+
+-----saali info lavastused tabelist repertuaari tabelisse ---------------------------
+alter table teatriliit.repertuaar_kokku
+ rename column statsionaar to statsionaar_algandmed;
+
+alter table teatriliit.repertuaar_kokku
+ add column if not exists statsionaar text;
+
+update teatriliit.repertuaar_kokku
+  set statsionaar = statsionaar_algandmed;
+
+update teatriliit.repertuaar_kokku rp
+	set statsionaar = temp.saal
+from (
+select distinct lavastuse_pealkiri || esietendus || teater as id
+	,statsionaarne_saal as saal
+from teatriliit.lavastused_koond
+) temp
+where 
+temp.id = rp.lavastuse_pealkiri || rp.esietendus || rp.teater;
+
+------------------------
+
+---- fact_majandusaasta_andmed -----
+
+create view teatriliit.fact_majandusaasta as
+with vahetabel1 as (
+ SELECT t.teater,
+    string_agg(m.ariregistri_kood::text, ';'::text) AS arireg_koodid,
+    string_agg(t.arinimi, ';'::text) AS arinimed,
+    m.aruanne,
+    m.aruandeaasta,
+    make_date(m.aruandeaasta::integer, 1, 1) AS aruande_kuupaev,
+    m.nimi,
+    m.rida,
+    sum(m.vaartus) AS vaartus
+   FROM teatriliit.teater_ariuhing t
+     JOIN teatriliit.majandusaasta_andmed m ON t.ariregistri_kood = m.ariregistri_kood
+  GROUP BY t.teater, m.aruanne, m.aruandeaasta, m.nimi, m.rida)
+,vahetabel2 AS (
+    SELECT
+        arireg_koodid,
+        arinimed,
+        aruande_kuupaev,
+        nimi,
+        teater,
+        MAX(vaartus) FILTER (WHERE rida = 'Aruandeaasta kasum (kahjum)')            AS kasum,
+        MAX(vaartus) FILTER (WHERE rida = 'Müügitulu')                              AS myygitulu,
+        MAX(vaartus) FILTER (WHERE rida = 'Põhivarade kulum ja väärtuse langus'
+                               AND aruanne = 'Kasumiaruanne skeem 1') * -1           AS kulum_skeem1,
+        MAX(vaartus) FILTER (WHERE rida = 'Põhivarade kulum ja väärtuse langus'
+                               AND aruanne = 'Tulemiaruanne') * -1                   AS kulum_tulem,
+        MAX(vaartus) FILTER (WHERE rida = 'Tööjõukulud'
+                               AND aruanne = 'Tulemiaruanne') * -1                   AS toojoukulud_tulem,
+        ABS(MAX(vaartus) FILTER (WHERE rida = 'Tööjõukulud'
+                               AND aruanne = 'Lisa: Tööjõukulud')  )                  AS toojoukulud_lisa,
+        MAX(vaartus) FILTER (WHERE rida = 'Tööjõukulud'
+                               AND aruanne = 'Kasumiaruanne skeem 1') * -1           AS toojoukulud_skeem1,
+        MAX(vaartus) FILTER (WHERE rida = 'Ärikasum (kahjum)')                      AS arikasum,
+        MAX(vaartus) FILTER (WHERE rida = 'Aruandeaasta tulem')                     AS tulem,
+        MAX(vaartus) FILTER (WHERE rida = 'Põhitegevuse tulem')                     AS pohitegevuse_tulem,
+        MAX(vaartus) FILTER (WHERE rida = 'Tulu ettevõtlusest')                     AS tulu_ettevotlusest,
+        MAX(vaartus) FILTER (WHERE rida = 'Tulud')                                  AS tulud,
+        MAX(vaartus) FILTER (WHERE rida = 'Töötajate keskmine arv taandatuna täistööajale')  AS fte
+    FROM vahetabel1
+    WHERE aruanne IN ('Tulemiaruanne', 'Kasumiaruanne skeem 1', 'Bilanss', 'Lisa: Tööjõukulud')
+    GROUP BY teater, arireg_koodid, arinimed, aruande_kuupaev, nimi
+),
+-- Merge the two schemes into single columns
+vahetabel3 AS (
+    SELECT
+        arireg_koodid,
+        arinimed,
+        aruande_kuupaev,
+        nimi,
+        teater,
+        COALESCE(myygitulu, 0) + COALESCE(tulud, 0)                      AS tulu,
+        tulu_ettevotlusest,
+        CASE WHEN tulud IS NOT NULL
+             THEN tulud - COALESCE(tulu_ettevotlusest, 0)
+        END                                              AS toetused,
+        COALESCE(kulum_tulem, 0) + COALESCE(kulum_skeem1, 0)            AS kulum,
+		COALESCE(toojoukulud_tulem, 0) + COALESCE(toojoukulud_skeem1, 0) AS toojoukulud,
+		COALESCE(toojoukulud_lisa, 0)									AS toojoukulud_lisa,
+		COALESCE(arikasum, 0) + COALESCE(pohitegevuse_tulem, 0)         AS pohitegevuse_tulem,
+		COALESCE(kasum, 0) + COALESCE(tulem, 0)                         AS kasum,
+        fte
+    FROM vahetabel2
+),
+-- Calculations on the merged columns
+vahetabel4 AS (
+    SELECT
+        arireg_koodid,
+        arinimed,
+        aruande_kuupaev,
+        --nimi,
+        teater,
+        tulu,
+        tulu_ettevotlusest,
+        toetused,
+        kulum,
+        toojoukulud,
+        case when toojoukulud = 0 then toojoukulud_lisa else case when toojoukulud_lisa = 0 then toojoukulud else toojoukulud_lisa end end toojoukulud_lisa,
+        tulu - (COALESCE(kulum, 0) + COALESCE(toojoukulud, 0)) AS jaaktulu,
+        pohitegevuse_tulem,
+        kasum,
+        fte
+    FROM vahetabel3
+)
+SELECT *,toojoukulud_lisa / 1.338 as toojoukulu_lisa_brutopalk
+		,case when coalesce(fte,0) = 0 then null else toojoukulud_lisa / 1.338 / fte / 12 end keskmine_brutokuupalk
+FROM vahetabel4;
+
+------------------
+
+-- One row per production. Prefer detailed-source descriptive attributes.
+-- If a source contains conflicting descriptions, MIN chooses one consistently.
+-- Theater ordering follows the database's default text collation.
+CREATE OR REPLACE VIEW teatriliit.dim_lavastused AS
+WITH source_rows AS (
+    SELECT
+        btrim(lavastuse_pealkiri::text) AS title,
+        nullif(btrim(esietendus::text), '') AS premiere_text,
+        nullif(btrim(teater::text), '') AS theater,
+        nullif(btrim(lavastuse_liik::text), '') AS production_type,
+        nullif(btrim(zanr::text), '') AS genre,
+        nullif(btrim(sihtgrupp::text), '') as target_group,
+        nullif(btrim(autor_dramatiseerija::text), '') AS author,
+        lower(btrim(koostoolavastus::text)) = 'jah' AS cooperation,
+        NULL::integer as max_production_year,   --sellel aastal toimunud etendused lavastusele
+        1 AS source_priority
+    FROM teatriliit.lavastused_koond
+    UNION ALL
+    SELECT
+        btrim(lavastuse_pealkiri::text),
+        nullif(btrim(esietendus::text), ''),
+        nullif(btrim(teater::text), ''),
+        nullif(btrim(lavastuse_liik::text), ''),
+        nullif(btrim(zanr::text), ''),
+        nullif(btrim(sihtgrupp::text), ''),
+        nullif(btrim(autor::text), ''),
+        false,
+        andmeaasta::integer,  --sellel aastal toimunud etendused lavastusele
+        2
+    FROM teatriliit.repertuaar_kokku
+), dated AS (
+    SELECT *,
+        CASE WHEN premiere_text LIKE '__.__.____'
+             THEN to_date(premiere_text, 'DD.MM.YYYY')
+             ELSE premiere_text::date
+        END AS premiere_date
+    FROM source_rows
+), productions AS (
+    SELECT
+        title,
+        premiere_date,
+        extract(year from premiere_date)::integer AS premiere_date_year,
+        coalesce(min(production_type) FILTER (WHERE source_priority = 1),
+                 min(production_type)) AS production_type,
+        coalesce(min(genre) FILTER (WHERE source_priority = 1),
+                 min(genre)) AS genre,
+        coalesce(min(target_group) filter (where source_priority = 1),
+        		min(target_group)) as target_group,
+        coalesce(min(author) FILTER (WHERE source_priority = 1),
+                 min(author)) AS author,
+        CASE WHEN bool_or(cooperation) OR count(DISTINCT theater) > 1
+             THEN 1 ELSE 0 END AS cooperation,
+        array_agg(DISTINCT theater ORDER BY theater)
+            FILTER (WHERE theater IS NOT NULL) AS theaters,
+        MAX(max_production_year ) as max_production_year
+    FROM dated
+    GROUP BY title, premiere_date
+), numbered AS (
+    SELECT *, row_number() OVER (ORDER BY title, premiere_date) AS production_number
+    FROM productions
+)
+SELECT
+    'P' || lpad(production_number::text,
+                greatest(3, length(production_number::text)), '0') AS lavastuse_id,
+    title AS lavastuse_nimi,
+    premiere_date AS "esietenduse_kuupaev",
+    premiere_date_year as esietenduse_aasta,
+    production_type AS lavastuse_liik,
+    genre AS zhanr,
+    target_group as sihtgrupp,
+    author AS autor,
+    cooperation AS "kas_on_koostoo",
+    theaters[1] AS juht_teatri_nimi,
+    nullif(array_to_string(theaters[2:cardinality(theaters)], '; '), '')
+        AS koostoo_teatrite_nimed,
+    -- Production year is the premiere year; a missing premiere date gives NULL.
+    -- Append this column so CREATE OR REPLACE works with the existing view.
+    max_production_year as viimati_esitatud_aasta,
+    max_production_year - premiere_date_year +1 as lavastuse_kestvus    
+FROM numbered;
+
+-- One row per theater, including theaters appearing in only one source.
+-- Use the latest reported ownership form; detailed data is the fallback.
+-- This is a current/latest classification, not a history of ownership changes.
+CREATE OR REPLACE VIEW teatriliit.dim_teater AS
+WITH owners AS (
+    SELECT
+        nullif(btrim(teater::text), '') AS teatri_nimi,
+        nullif(btrim(omandivorm::text), '') AS omandivorm,
+        nullif(btrim(andmeaasta::text), '')::numeric::integer AS reporting_year
+    FROM teatriliit.repertuaar_kokku
+    UNION ALL
+    SELECT
+        nullif(btrim(teater::text), ''),
+        nullif(btrim(omanik::text), ''),
+        NULL::integer
+    FROM teatriliit.lavastused_koond
+)
+SELECT DISTINCT ON (teatri_nimi)
+    teatri_nimi,
+    omandivorm
+FROM owners
+WHERE teatri_nimi IS NOT NULL
+ORDER BY teatri_nimi, (omandivorm IS NULL), reporting_year DESC NULLS LAST,
+         omandivorm;
+
+-- One row per reporting theater and reported hall label.
+-- Generic hall names such as Suur saal must not join across different theaters.
+-- Preserve full labels: the sources do not provide a reliable hall crosswalk.
+-- Different labels for the same physical hall remain separate until mapped.
+-- A readable composite text key is sufficient for these source files.
+-- Missing hall labels and '-' share the label Teadmata saal.
+CREATE OR REPLACE VIEW teatriliit.dim_saal AS
+WITH halls AS (
+    SELECT
+        btrim(teater::text) AS teatri_nimi,
+        coalesce(nullif(nullif(btrim(statsionaarne_saal::text), ''), '-'),
+                 'Teadmata saal') AS saali_nimi,
+        nullif(btrim(istekohtade_arv::text), '')::numeric::bigint AS seats
+    FROM teatriliit.lavastused_koond
+    UNION ALL
+    SELECT
+        btrim(teater::text),
+        coalesce(nullif(nullif(btrim(statsionaar::text), ''), '-'),
+                 'Teadmata saal'),
+        NULL::bigint
+    FROM teatriliit.repertuaar_kokku
+)
+SELECT
+    teatri_nimi || ' | ' || saali_nimi AS saal_id,
+    teatri_nimi,
+    saali_nimi,
+    -- Maximum reported seats, not a verified physical capacity.
+    -- Annual-only hall labels have NULL capacity.
+    max(seats) AS istekohtade_arv_max
+FROM halls
+GROUP BY teatri_nimi, saali_nimi;
+
+-- Daily calendar covering all premiere dates and the 2014-2025 reporting period.
+-- Annual facts use January 1 as their relationship date, not a performance date.
+CREATE OR REPLACE VIEW teatriliit.dim_aeg AS
+WITH bounds AS (
+    SELECT
+        least(DATE '2014-01-01', min("esietenduse_kuupaev")) AS first_date,
+        greatest(DATE '2025-12-31', max("esietenduse_kuupaev")) AS last_date
+    FROM teatriliit.dim_lavastused
+)
+SELECT
+    d::date AS "kuupaev",
+    extract(year FROM d)::integer AS aasta,
+    extract(quarter FROM d)::integer AS kvartal,
+    extract(month FROM d)::integer AS kuu,
+    extract(day FROM d)::integer AS "paev"
+FROM bounds
+CROSS JOIN LATERAL generate_series(
+    first_date::timestamp, last_date::timestamp, INTERVAL '1 day'
+) AS dates(d);
+
+-- Annual fact grain: reporting year + production + reporting theater + hall.
+-- Keep each reporting theater's amounts, even for a cooperative production.
+-- The main theater and collaborator list are available in dim_lavastused.
+CREATE OR REPLACE VIEW teatriliit.fact_repertuaar AS
+WITH source_rows AS (
+    SELECT
+        nullif(btrim(andmeaasta::text), '')::numeric::integer AS aasta,
+        btrim(lavastuse_pealkiri::text) AS title,
+        nullif(btrim(esietendus::text), '') AS premiere_text,
+        btrim(teater::text) AS teatri_nimi,
+        coalesce(nullif(nullif(btrim(statsionaar::text), ''), '-'),
+                 'Teadmata saal') AS saal,
+        nullif(btrim(piletitulu::text), '')::numeric AS revenue,
+        nullif(btrim(kylastajaid_kohapeal::text), '')::numeric::bigint AS onsite_visitors_yearly,
+        nullif(btrim(veebis_kylastajaid::text), '')::numeric::bigint as web_visitors_yearly,
+        nullif(btrim(esituskorrad_kokku::text), '')::numeric::bigint AS performances
+    FROM teatriliit.repertuaar_kokku
+), dated AS (
+    SELECT *,
+        CASE WHEN premiere_text LIKE '__.__.____'
+             THEN to_date(premiere_text, 'DD.MM.YYYY')
+             ELSE premiere_text::date
+        END AS premiere_date
+    FROM source_rows
+)
+SELECT
+    r.aasta,
+    make_date(r.aasta, 1, 1) AS aruande_kuupaev,
+    p.lavastuse_id,
+    r.teatri_nimi,
+    r.saal,
+    r.teatri_nimi || ' | ' || r.saal AS saal_id,
+    -- Revenue is decimal because the source includes cents.
+    sum(r.revenue) AS piletitulu,
+    sum(r.onsite_visitors_yearly)::bigint AS "kylastajaid_kohapeal",
+    sum(r.web_visitors_yearly)::bigint as "kylastajaid_veebis",
+    sum(r.performances)::bigint AS esituskorrad,
+    -- Both flags mean premiere year equals reporting year.
+    -- This is an explicit calendar-based definition, not a separate status feed.
+    CASE WHEN r.premiere_date IS NULL THEN NULL
+         WHEN extract(year FROM r.premiere_date) = r.aasta THEN 1
+         ELSE 0 END AS uuslavastus,
+	-- Production status as of the final reporting year, 2025.
+	CASE
+    	WHEN p.viimati_esitatud_aasta = 2025 THEN 'käimas'
+    	WHEN p.viimati_esitatud_aasta < 2025 THEN 'lõppenud'
+    	ELSE NULL
+END AS "loppenud_lavastus"
+FROM dated r
+JOIN teatriliit.dim_lavastused p
+  ON p.lavastuse_nimi = r.title
+ AND p."esietenduse_kuupaev" IS NOT DISTINCT FROM r.premiere_date
+GROUP BY     
+	r.aasta,
+    p.lavastuse_id,
+    r.teatri_nimi,
+    r.saal,
+    r.premiere_date,
+    p.viimati_esitatud_aasta;
+
+-- Period-total fact grain: production + reporting theater + reported hall.
+-- These are 2014-2025 totals. There is deliberately no reporting-year key.
+-- Never join these totals to annual source rows: that would multiply totals.
+CREATE OR REPLACE VIEW teatriliit."fact_moodikud" AS
+WITH source_rows AS (
+    SELECT
+        btrim(lavastuse_pealkiri::text) AS title,
+        nullif(btrim(esietendus::text), '') AS premiere_text,
+        btrim(teater::text) AS teatri_nimi,
+        coalesce(nullif(nullif(btrim(statsionaarne_saal::text), ''), '-'),
+                 'Teadmata saal') AS saal,
+        nullif(btrim(istekohtade_arv::text), '')::numeric::bigint AS seats,
+        nullif(btrim(myydud_piletid::text), '')::numeric::bigint AS tickets,
+		nullif(btrim(kohapealseid_kylastajaid::text), '')::numeric::bigint AS onsite_visitors,
+		nullif(btrim(kylastajais_veebis::text), '')::numeric::bigint AS online_visitors,
+        nullif(btrim(maakonnade_arv::text), '')::numeric::bigint AS counties,
+        nullif(btrim(kylalisetendused::text), '')::numeric::bigint AS guest_performances,
+        nullif(btrim(valismaal_antud_etendused::text), '')::numeric::bigint
+            AS foreign_performances
+    FROM teatriliit.lavastused_koond
+), dated AS (
+    SELECT *,
+        CASE WHEN premiere_text LIKE '__.__.____'
+             THEN to_date(premiere_text, 'DD.MM.YYYY')
+             ELSE premiere_text::date
+        END AS premiere_date
+    FROM source_rows
+)
+SELECT
+    p.lavastuse_id,
+    r.teatri_nimi,
+    r.teatri_nimi || ' | ' || r.saal AS saal_id,
+    -- Capacity is not additive across duplicate source rows or productions.
+    max(r.seats) AS istekohtade_arv,
+    sum(r.tickets)::bigint AS "muudud_piletite_arv",
+    sum(r.onsite_visitors)::bigint AS kohapealseid_kylastajaid,
+	sum(r.online_visitors)::bigint AS kylastajaid_veebis,
+	-- County counts cannot be added without knowing the underlying counties.
+    -- MAX retains the largest reported count at this grain, not a distinct union.
+    max(r.counties) AS maakondade_arv,
+    sum(r.guest_performances)::bigint AS "kylalisetenduste_arv",
+    sum(r.foreign_performances)::bigint AS "valismaa_etenduste_arv"
+FROM dated r
+JOIN teatriliit.dim_lavastused p
+  ON p.lavastuse_nimi = r.title
+ AND p."esietenduse_kuupaev" IS NOT DISTINCT FROM r.premiere_date
+GROUP BY p.lavastuse_id, r.teatri_nimi, r.saal;
+COMMIT;
+
+-- Power BI: create one-to-many relationships with single-direction filtering.
+-- dim_lavastused.lavastuse_id -> both fact views' lavastuse_id
+-- dim_teater.teatri_nimi      -> both fact views' teatri_nimi
+-- dim_saal.saal_id            -> both fact views' saal_id
+-- dim_aeg.kuupäev             -> fact_repertuaar.aruande_kuupaev
+-- Mark dim_aeg as the date table using kuupäev.
+-- Do not relate the two fact views directly or connect dim_aeg to period totals.
+-- Do not add active dimension-to-dimension relationships; these can create
+-- ambiguous filter paths. Premiere-date analysis can use an inactive relationship.
+-- main_theater_name is a production attribute; teatri_nimi filters reported amounts.
+-- Use MAX rather than SUM for seat capacity. County counts are not additive:
+-- a cross-production distinct county total is unavailable from these sources.
+-- Flags are at annual fact grain; count distinct production IDs for production counts.
+-- No source-specific production corrections are applied.
+-- Filter dim_lavastused.uuslavastuse_aasta to analyze productions by premiere year.
