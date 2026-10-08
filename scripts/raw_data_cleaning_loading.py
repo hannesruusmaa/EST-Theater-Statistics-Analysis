@@ -1,31 +1,8 @@
-"""Clean annual repertuaar Excel files and the combined lavastused workbook.
+"""Clean theater statistics files and load them into the database.
 
-MIDA TEHA:
-- jooksuta terminalis install command 'python -m pip install pandas openpyxl sqlalchemy psycopg2-binary'
-- paranda repertuaar ja lavastuse PATH ära vastavalt enda arvutile (Read 41 ja 45)
-- jooksuta 'python "MAIN_teatri_excel_import.py"' kood terminalis
-    - kui see ei tööta, siis vaata, et terminal oleks õiges kaustas, seda saab parandada 'cd "ÕIGE KAUSTA PATH"'
-- ta küsib terminalis parooli 'andmed' kirjuta see terminali sisse
-    - NB! sa ei näe tähti, kui sa kirjutad. Ehk kirjuta parool ära ja vajuta enter. 
-- palju õnne, sul on postgres'is andmed.
-
-Python 3.10+. Install once:
-    python -m pip install pandas openpyxl sqlalchemy psycopg2-binary
-
-Edit the paths below, then run:
-    python MAIN_teatri_excel_import.py --dry-run
-    python MAIN_teatri_excel_import.py
-
-    
-The first sheet is read from each workbook. Repertuaar headings are on row 3;
-lavastused headings are on row 1. All configured years must be present.
-
-Writes teatriliit.repertuaar_kokku and teatriliit.lavastused_koond directly;
-no intermediate CSV. Both tables are REPLACED, as in the original importers.
-Replacement recreates tables: custom indexes/constraints/grants are not retained.
-Both replacements use one PostgreSQL transaction; a failure rolls both back.
-Rows are not deduplicated: a shared title alone does not identify a production.
-Existing views referencing these tables may prevent replacement (no CASCADE).
+Requires Python 3.10+.
+See README.md for installation and setup instructions.
+Edit REPO_DIR below before running.
 """
 
 import argparse
@@ -34,64 +11,53 @@ import os
 import re
 import unicodedata
 from pathlib import Path
-
 import pandas as pd
 
-# ---------- Configuration: edit these paths to match your computer ----------
-# The uploaded scripts used two different repository roots; verify both paths.
-REPERTUAAR_DIR = Path(
-     r"C:\Users\opilane\Documents\GitHub\teatriliit"
-    #or
-    #r"C:\Users\Administrator\Documents\GitHub\teatriliit"
-    #and
-    r"\Baasandmed\statistika_teater_ee\repertuaar\puhastamata"
-)
-LAVASTUSED_FILE = Path(
-     r"C:\Users\opilane\Documents\GitHub\teatriliit"
-    #or
-    #r"C:\Users\Administrator\Documents\GitHub\teatriliit"
-    #and
-    r"\Baasandmed\statistika_teater_ee\lavastused\puhastamata"
-    r"\2014-2025LAVastused.xlsx"
-)
-LAVASTUSE_NIMEKORREKTSIOON_FILE = Path(
-     r"C:\Users\opilane\Documents\GitHub\teatriliit"
-    #or
-    #r"C:\Users\Administrator\Documents\GitHub\teatriliit"
-    #and
-    r"\Baasandmed\statistika_teater_ee\repertuaar\puhastamata"
-    r"\lavastuse_nimekorrektsioon.xlsx"
+# Resolve the repository root when this script is stored directly in scripts/.
+REPO_DIR = Path(__file__).resolve().parents[1]
+
+DATA_DIR = REPO_DIR / "data"
+
+REPERTOIRE_DIR = (
+    DATA_DIR
+    / "raw"
+    / "repertoire_yearly_2014_until_2025"
 )
 
-TEATER_ARIUHING_FILE = Path(
-     r"C:\Users\opilane\Documents\GitHub\teatriliit"
-    #or
-    #r"C:\Users\Administrator\Documents\GitHub\teatriliit"
-    #and
-    r"\Baasandmed\ariregister"
-    r"\teater_ariuhingud.xlsx"
+PRODUCTIONS_FILE = (
+    DATA_DIR
+    / "raw"
+    / "production_total_2014_until_2025"
+    / "production_data_total_2014_until_2025.xlsx"
 )
 
-MAJANDUSAASTA_ANDMED_FILE = Path(
-     r"C:\Users\opilane\Documents\GitHub\teatriliit"
-    #or
-    #r"C:\Users\Administrator\Documents\GitHub\teatriliit"
-    #and
-    r"\Baasandmed\ariregister"
-    r"\majandusaasta_andmed.xlsx"
+PRODUCTION_CORRECTION_FILE = (
+    DATA_DIR
+    / "reference"
+    / "production_name_correction.xlsx"
+)
+
+THEATER_BUSINESS_REGISTRY_FILE = (
+    DATA_DIR
+    / "reference"
+    / "business_registry_theaters.xlsx"
+)
+
+FINANCIAL_YEAR_DATA_FILE = (
+    DATA_DIR
+    / "processed"
+    / "business_registry_financial_year_data_2019_until_2025"
+    / "financial_year_data.xlsx"
 )
 
 FILE_PATTERN = "teatrite_repertuaar_{year}.xlsx"
 START_YEAR, END_YEAR = 2014, 2025
-SCHEMA = "teatriliit"
+SCHEMA = "teater"
 DB_HOST = os.environ.get("PGHOST", "localhost")
 DB_PORT = int(os.environ.get("PGPORT", "5432"))
 DB_NAME = os.environ.get("PGDATABASE", "postgres")
 DB_USER = os.environ.get("PGUSER", "postgres")
 # Password is read from PGPASSWORD or requested securely at runtime.
-
-# Only these title columns are normalized; headings otherwise stay compatible.
-# Add your actual normalized heading here if it differs.
 TITLE_COLUMNS = {
     "lavastuse_pealkiri", "lavastuse_nimi", "lavastuse_nimetus",
     "etenduse_nimi", "etenduse_nime", "etenduse_pealkiri",
@@ -99,8 +65,13 @@ TITLE_COLUMNS = {
 
 
 def clean_text(df):
-    """Trim text, standardize Unicode, preserve missing values and numbers."""
+    """Clean text cells in place and return rows that are not entirely empty.
+
+    Trim surrounding whitespace, normalize Unicode, and treat empty strings
+    as missing values. Preserve non-string values, including numbers and dates.
+    """
     def clean(value):
+        """Clean one text value while leaving non-string values unchanged."""
         if isinstance(value, str):
             value = unicodedata.normalize("NFC", value).strip()
             return value if value else pd.NA
@@ -112,6 +83,10 @@ def clean_text(df):
 
 
 def normalize_title(value):
+    """Standardize quotation marks and whitespace for production-title matching.
+
+    Preserve non-string values and return a missing value for an empty title.
+    """
     if not isinstance(value, str):
         return value
 
@@ -129,6 +104,11 @@ def normalize_title(value):
 
 
 def clean_titles(df, label, candidates=None):
+    """Normalize recognized title columns in place and report how many changed.
+
+    Use TITLE_COLUMNS unless a candidate set is supplied. Raise ValueError
+    when no recognized title column is present, and return the DataFrame.
+    """
     columns = sorted(set(df.columns) & (TITLE_COLUMNS if candidates is None else candidates))
     if not columns:
         raise ValueError(
@@ -144,6 +124,12 @@ def clean_titles(df, label, candidates=None):
 
 
 def clean_column_names(df):
+    """Normalize column headings in place for use in the database.
+
+    Lowercase headings, translate selected Estonian characters, and replace
+    spaces and slashes with underscores. Reject duplicate headings and names
+    exceeding PostgreSQL's 63-byte identifier limit. Return the DataFrame.
+    """
     translation = str.maketrans({
         'õ': 'o', 'ä': 'a', 'ö': 'o', 'ü': 'y', 'ž': 'z', ' ': '_', '/': '_'
     })
@@ -207,6 +193,13 @@ NUMERIC_COLUMNS = [
 def load_year(path, year):
 
     # The third Excel row contains the column headings.
+    """Load and clean one year's repertoire data from the first Excel sheet.
+
+    Read headings from row 3, validate the columns, and assign ownership labels
+    from section rows to the following records. Convert numeric fields,
+    normalize titles, and return OUTPUT_COLUMNS with the reporting year added.
+    Reject unexpected headings, missing required columns, and invalid numbers.
+    """
     df = pd.read_excel(path, header=2).dropna(how="all")
 
     # Normalize heading capitalization and extra spaces.
@@ -307,8 +300,12 @@ def load_year(path, year):
 
 
 def load_lavastused(path):
-    # Preserve all columns and Excel-inferred numeric/date types. The original
-    # lavastused importer did not specify numeric conversions or row filtering.
+    """Load the combined production workbook from its first sheet.
+
+    Read headings from row 1, clean headings and text, and normalize recognized
+    production-title columns. Preserve Excel-inferred numeric and date types
+    and return the cleaned DataFrame. Reject empty data or missing title columns.
+    """
     df = pd.read_excel(path, header=0).dropna(how="all")
     df = clean_text(clean_column_names(df))
     df = clean_titles(df, path.name)
@@ -318,8 +315,12 @@ def load_lavastused(path):
     return df
 
 def load_nimekorrektsioon(path):
-    # Preserve all columns and Excel-inferred numeric/date types. The original
-    # lavastused importer did not specify numeric conversions or row filtering.
+    """Load the production-name correction workbook from its first sheet.
+
+    Read headings from row 1 and clean headings and text without applying title
+    normalization. Preserve all columns and Excel-inferred numeric and date
+    types, and return the cleaned DataFrame. Reject an empty dataset.
+    """
     df = pd.read_excel(path, header=0).dropna(how="all")
     df = clean_text(clean_column_names(df))
     #df = clean_titles(df, path.name)
@@ -329,8 +330,12 @@ def load_nimekorrektsioon(path):
     return df
 
 def load_teater_ariuhingud(path):
-    # Preserve all columns and Excel-inferred numeric/date types. The original
-    # lavastused importer did not specify numeric conversions or row filtering.
+    """Load the theatre-to-business-registry mapping from the first Excel sheet.
+
+    Read headings from row 1 and clean headings and text. Preserve all columns
+    and Excel-inferred numeric and date types, and return the cleaned DataFrame.
+    Reject an empty dataset.
+    """
     df = pd.read_excel(path, header=0).dropna(how="all")
     df = clean_text(clean_column_names(df))
     #df = clean_titles(df, path.name)
@@ -341,8 +346,12 @@ def load_teater_ariuhingud(path):
 
 
 def load_majandusaasta_andmed(path):
-    # Preserve all columns and Excel-inferred numeric/date types. The original
-    # lavastused importer did not specify numeric conversions or row filtering.
+    """Load the prepared annual financial workbook from its first sheet.
+
+    Read headings from row 1 and clean headings and text. Preserve all columns
+    and Excel-inferred types without additional numeric or date conversions,
+    and return the cleaned DataFrame. Reject an empty dataset.
+    """
     df = pd.read_excel(path, header=0).dropna(how="all")
     df = clean_text(clean_column_names(df))
     #df = clean_titles(df, path.name)
@@ -352,6 +361,14 @@ def load_majandusaasta_andmed(path):
     return df
 
 def write_database(repertuaar, lavastused, lavastuse_nimekorrektsioon, teater_ariuhing, majandusaasta_andmed):
+    """Replace the five import tables in SCHEMA within one database transaction.
+
+    Use the configured PostgreSQL connection and obtain the password from
+    PGPASSWORD or a secure prompt. Create the schema if needed and store text
+    columns as SQL TEXT. A failed write rolls back the transaction; successful
+    replacement recreates the tables rather than preserving their definitions.
+    Close the engine when finished.
+    """
     from sqlalchemy import create_engine, text
     from sqlalchemy.engine import URL
     from sqlalchemy.types import TEXT
@@ -385,13 +402,19 @@ def write_database(repertuaar, lavastused, lavastuse_nimekorrektsioon, teater_ar
 
 
 def main():
+    """Read command-line options and run the import pipeline.
+
+    Check the year range and required repertoire/production file paths, then
+    load all five datasets. Stop before connecting to PostgreSQL when --dry-run
+    is selected; otherwise replace the database import tables.
+    """
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--repertuaar-dir", type=Path, default=REPERTUAAR_DIR)
-    parser.add_argument("--lavastused-file", type=Path, default=LAVASTUSED_FILE)
-    parser.add_argument("--lavastuse_nimekorrektsioon-file", type=Path, default=LAVASTUSE_NIMEKORREKTSIOON_FILE)
-    parser.add_argument("--teater_ariuhing-file", type=Path, default=TEATER_ARIUHING_FILE)
-    parser.add_argument("--majandusaasta_andmed-file", type=Path, default=MAJANDUSAASTA_ANDMED_FILE)
+    parser.add_argument("--repertoire-dir", type=Path, default=REPERTOIRE_DIR)
+    parser.add_argument("--lavastused-file", type=Path, default=PRODUCTIONS_FILE)
+    parser.add_argument("--lavastuse_nimekorrektsioon-file", type=Path, default=PRODUCTION_CORRECTION_FILE)
+    parser.add_argument("--teater_ariuhing-file", type=Path, default=THEATER_BUSINESS_REGISTRY_FILE)
+    parser.add_argument("--majandusaasta_andmed-file", type=Path, default=FINANCIAL_YEAR_DATA_FILE)
     parser.add_argument("--start-year", type=int, default=START_YEAR)
     parser.add_argument("--end-year", type=int, default=END_YEAR)
     parser.add_argument("--dry-run", action="store_true",
@@ -400,7 +423,7 @@ def main():
     if args.start_year > args.end_year:
         parser.error("--start-year must not exceed --end-year")
     years = range(args.start_year, args.end_year + 1)
-    paths = [(year, args.repertuaar_dir / FILE_PATTERN.format(year=year)) for year in years]
+    paths = [(year, args.repertoire_dir / FILE_PATTERN.format(year=year)) for year in years]
     missing = [str(path) for path in [*(p for _, p in paths), args.lavastused_file]
                if not path.is_file()]
     if missing:
@@ -411,14 +434,14 @@ def main():
     lavastused = load_lavastused(args.lavastused_file)
     lavastuse_nimekorrektsioon = load_nimekorrektsioon(args.lavastuse_nimekorrektsioon_file)
     teater_ariuhing = load_teater_ariuhingud(args.teater_ariuhing_file)
-    majandusaaseta_andmed = load_majandusaasta_andmed(args.majandusaasta_andmed_file)
+    majandusaasta_andmed = load_majandusaasta_andmed(args.majandusaasta_andmed_file)
     print(f"Validated: {len(repertuaar):,} repertuaar rows, {len(lavastused):,} lavastused rows., {len(lavastuse_nimekorrektsioon):,} nimekorrektsiooni rows.")
 
     
     if args.dry_run:
         print("Dry run complete. No database connection or changes made.")
         return
-    write_database(repertuaar, lavastused, lavastuse_nimekorrektsioon, teater_ariuhing, majandusaaseta_andmed)
+    write_database(repertuaar, lavastused, lavastuse_nimekorrektsioon, teater_ariuhing, majandusaasta_andmed)
 
 
 if __name__ == "__main__":
