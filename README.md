@@ -20,17 +20,17 @@ Developed as a group final project for the [BCS data analysis microqualification
 - [Research plan](#research-plan)
 - [Project outcomes](#project-outcomes)
 - [Dashboards](#dashboards)
-- [Deliverables](#deliverables-in-progress)
+- [Deliverables](#deliverables)
 - [Data sources](#data-sources)
 - [Data exploration and scope decisions](#data-exploration-and-scope-decisions)
 - [Tools and workflow](#tools-and-workflow)
 - [Metric definitions](#metric-definitions)
 - [Data model](#data-model)
-- [Repository structure](#repository-structure-in-progress)
-- [Getting started](#getting-started-in-progress)
+- [Repository structure](#repository-structure)
+- [Getting started](#getting-started)
 - [Data quality and limitations](#data-quality-and-limitations)
 - [Team](#team)
-- [Acknowledgements and licensing](#acknowledgements-and-licensing-in-progress)
+- [Acknowledgements and licensing](#acknowledgements-and-licensing)
 
 ## Project overview
 
@@ -116,10 +116,10 @@ Detailed tables of active production years, production lifespan, and performance
 
 | Deliverable | Location |
 |---|---|
-| Final report | (reports/project_documentation.pdf) |
-| Power BI dashboard | (powerbi/theater_agency_analysis.pbix) |
-| Data preparation scripts | (scripts/raw_data_cleaning_loading.py)(scripts/business_registry_filtering.ipynb) |
-| SQL scripts | (scripts/view_creation_postgres.txt) |
+| Final report | [Project documentation](reports/project_documentation.pdf) |
+| Power BI dashboard | [Theatre analysis dashboard](powerbi/theater_agency_analysis.pbix) |
+| Data preparation scripts | [Data cleaning and loading](scripts/raw_data_cleaning_loading.py), [Business Register filtering](scripts/business_registry_filtering.ipynb) |
+| SQL scripts | [Corrections and reporting views](sql/view_creation_postgres.txt) |
 
 ## Data sources
 
@@ -144,7 +144,7 @@ Detailed tables of active production years, production lifespan, and performance
 - **Downloaded:** 21 September 2026.
 - **Source:** [Business Register open-data downloads](https://avaandmed.ariregister.rik.ee/et/avaandmete-allalaadimine).
 
-Source files are primarily Excel workbooks. Acquisition instructions, field definitions, file versions, and access conditions will be documented in `data/README.md`, including which files are supplied and which must be obtained separately.
+Source files are primarily Excel workbooks. Acquisition instructions, field definitions, file versions, and access conditions are documented in `data/README.md`, including which files are supplied and which must be obtained separately.
 
 ## Data exploration and scope decisions
 
@@ -201,7 +201,7 @@ The report distinguishes between elapsed production lifespan and the years in wh
 | Average ticket price | `Keskmine piletihind` | Total ticket revenue divided by tickets sold. |
 | Estimated unpaid attendance | `Piletita külastajad` | Onsite attendance minus tickets sold, also expressed as a percentage of onsite attendance. |
 | FTE workforce | `FTE` | Sum of positive full-time-equivalent workforce values in the current selection. When multiple years are selected, this sums annual values rather than counting unique employees. |
-| Gross-pay total | `Brutopalk` | Sum of the imported `toojoukulu_lisa_brutopalk` field in the current selection. |
+| Estimated gross-pay total | `Brutopalk` | Sum of estimated gross pay, calculated in SQL by dividing labour costs by 1.338. |
 | Estimated average monthly gross salary | `Keskmine kuupalk` | Sum of gross pay divided by 12 times the sum of annual FTE, considering years with positive FTE. |
 | Selected segment attendance | `Valitud teatrite külastajad` | Total onsite attendance for theatres belonging to the selected attendance rank bands. |
 | Selected segment attendance share | `Valitud teatrite osakaal` | Selected segment attendance divided by total attendance among eligible theatres in the current selection. |
@@ -401,34 +401,22 @@ Built by pivoting `majandusaasta_andmed` rows into columns, per theater and year
 | `sql/` | Database setup, corrections, and analytical views |
 | `powerbi/` | Power BI report files |
 | `reports/` | Final report and presentation |
-| `requirements.txt` | Python dependencies and versions |
+| `requirements.txt` | Python dependencies |
 | `.gitignore` | Files excluded from version control |
 | `LICENSE` | Licence for the team's original work |
 
-## Getting started IN-PROGRESS
+## Getting started
 
 ### Requirements
 
-- **Python:** 3.14 (tested). Install dependencies:
-
-```bash
-python -m pip install -r requirements.txt
-```
-
+- **Python:** 3.14 (tested).
 - **PostgreSQL:** 18 or newer. The scripts expect a database named `postgres` on `localhost` with the `teater` schema.
 - **Power BI Desktop:** version from September 2026 or newer.
-- **Source data:** See `data/README.md` once completed.
+- **Source data:** See `data/README.md`.
 
 ### Run order
 
-1. Clone this repository and install the Python dependencies.
-2. Obtain the required source workbooks and place them in the documented input directory.
-3. Create the PostgreSQL database and configure the connection locally. The draft uses the schema `teater`.
-4. Run the Python import and cleaning script. The draft references `MAIN_teatri_excel_import.py`; add its final path and command here.
-5. Execute the SQL corrections and reporting views. The draft references `MAIN_view.txt`; confirm the final SQL filename and execution order.
-6. Open the Power BI report, configure its PostgreSQL connection, and refresh the data.
-
-**TODO:** Document required configuration variables, input filenames, expected outputs, and any manual correction steps. Keep passwords and database credentials outside version-controlled files.
+See `data/README.md` for exact run order.
 
 ## Data quality and limitations
 
