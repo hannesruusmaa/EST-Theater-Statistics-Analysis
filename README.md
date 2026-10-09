@@ -15,6 +15,7 @@ Developed as a group final project for the [BCS data analysis microqualification
 
 ## Contents
 
+- [Team](#team)
 - [Project overview](#project-overview)
 - [Research questions](#research-questions)
 - [Research plan](#research-plan)
@@ -29,7 +30,6 @@ Developed as a group final project for the [BCS data analysis microqualification
 - [Repository structure](#repository-structure)
 - [Getting started](#getting-started)
 - [Data quality and limitations](#data-quality-and-limitations)
-- [Team](#team)
 - [Acknowledgements and licensing](#acknowledgements-and-licensing)
 
 ## Project overview
